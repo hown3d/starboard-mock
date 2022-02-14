@@ -3,12 +3,16 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
+	"os"
+	"sort"
 
 	"github.com/aquasecurity/starboard/pkg/apis/aquasecurity/v1alpha1"
 	"github.com/aquasecurity/starboard/pkg/ext"
 	"github.com/aquasecurity/starboard/pkg/kube"
 	"github.com/aquasecurity/starboard/pkg/plugin/trivy"
+	"github.com/aquasecurity/starboard/pkg/report/templates"
 	"github.com/aquasecurity/starboard/pkg/runner"
 	"github.com/aquasecurity/starboard/pkg/starboard"
 	"github.com/aquasecurity/starboard/pkg/vulnerabilityreport"
@@ -18,6 +22,10 @@ import (
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
+)
+
+const (
+	ecsKind = "ecs"
 )
 
 // TODO: Remove job after successfull
@@ -48,9 +56,10 @@ func main() {
 		log.Fatalf("initializing trivy: %v", err)
 	}
 
+	mockPod := newMockPod("test", "ecscluster")
 	job, secrets, err := vulnerabilityreport.NewScanJobBuilder().
 		WithPlugin(plugin).
-		WithObject(newMockPod("test", "default")).
+		WithObject(mockPod).
 		WithPluginContext(plugCtx).
 		Get()
 
@@ -87,6 +96,12 @@ func main() {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      fmt.Sprintf("test-%v", containerName),
 				Namespace: "default",
+				Labels: map[string]string{
+					starboard.LabelContainerName:     containerName,
+					starboard.LabelResourceKind:      ecsKind,
+					starboard.LabelResourceName:      mockPod.Name,
+					starboard.LabelResourceNamespace: mockPod.Namespace,
+				},
 			},
 			Report: reportData,
 		}
@@ -98,6 +113,33 @@ func main() {
 	if err != nil {
 		log.Fatalf("writing reports: %v", err)
 	}
+
+	ref, err := kube.ObjectRefFromObjectMeta(mockPod.ObjectMeta)
+	if err != nil {
+		log.Fatalf("retrieving object ref: %v", err)
+	}
+
+	generateReport(cl, ref, reports, os.Stdout)
+}
+
+func generateReport(client client.Client, workload kube.ObjectRef, reports []v1alpha1.VulnerabilityReport, w io.Writer) {
+	vulnsReports := map[string]v1alpha1.VulnerabilityReportData{}
+	for _, vulnerabilityReport := range reports {
+		containerName, ok := vulnerabilityReport.Labels[starboard.LabelContainerName]
+		if !ok {
+			continue
+		}
+
+		sort.Stable(vulnerabilityreport.BySeverity{Vulnerabilities: vulnerabilityReport.Report.Vulnerabilities})
+
+		vulnsReports[containerName] = vulnerabilityReport.Report
+	}
+	workloadReport := templates.WorkloadReport{
+		Workload:     workload,
+		GeneratedAt:  ext.NewSystemClock().Now(),
+		VulnsReports: vulnsReports,
+	}
+	templates.WritePageTemplate(w, &workloadReport)
 }
 
 func controllerClient(config *rest.Config) (client.Client, error) {
@@ -119,6 +161,11 @@ func newMockPod(name, namespace string) *corev1.Pod {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: namespace,
+			Labels: map[string]string{
+				starboard.LabelResourceName:      name,
+				starboard.LabelResourceKind:      ecsKind,
+				starboard.LabelResourceNamespace: namespace,
+			},
 		},
 		Spec: corev1.PodSpec{
 			Containers: []corev1.Container{
